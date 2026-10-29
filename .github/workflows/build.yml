@@ -1303,13 +1303,29 @@ jobs:
             if patch -p1 --dry-run --forward < "$BBR3_PATCH" >/dev/null 2>&1; then
               patch -p1 --no-backup-if-mismatch < "$BBR3_PATCH"
               echo "[+] BBRv3 补丁已应用"
+            elif patch -p1 --dry-run --forward -F 3 < "$BBR3_PATCH" >/dev/null 2>&1; then
+              # LTS 分支会持续合入上游 stable 提交（如 sysctl_net_ipv4.c 的
+              # tcp_min_rcvbuf），补丁的上下文行随之漂移。fuzz 3 只放宽上下文
+              # 匹配，hunk 内容仍须原样落位，可安全吸收这类偏移。
+              patch -p1 --no-backup-if-mismatch -F 3 < "$BBR3_PATCH"
+              echo "[+] BBRv3 补丁已应用（LTS 上下文漂移，fuzz 3）"
             elif grep -q '^config TCP_CONG_BBR3' net/ipv4/Kconfig; then
               echo "[*] BBRv3 补丁此前已应用，跳过"
             else
               net_fail "BBRv3 补丁应用失败（${AVER}-${KVER}）"
             fi
+            # 防止 fuzz 应用时漏掉新增文件/配置项后继续编译
+            [ -f net/ipv4/tcp_bbr3.c ] || net_fail "BBRv3 补丁应用后缺少 net/ipv4/tcp_bbr3.c"
+            grep -q '^config TCP_CONG_BBR3' net/ipv4/Kconfig || net_fail "BBRv3 补丁应用后缺少 TCP_CONG_BBR3 配置项"
           else
             echo "[*] ${AVER}-${KVER} 无 BBRv3 backport，使用 BBR v1"
+          fi
+
+          # 5.15.41 等旧内核缺少 tcp_snd_cwnd accessors（新 5.15 已回移），
+          # BBRv3 补丁默认依赖它们；仅在缺失时补齐。
+          if [ -n "$BBR3_PATCH" ] && ! grep -q 'tcp_snd_cwnd' include/net/tcp.h; then
+            python3 "$GITHUB_WORKSPACE/scripts/net_compat/add_tcp_snd_cwnd.py" \
+              || net_fail "旧内核 tcp_snd_cwnd 兼容处理失败"
           fi
 
           # 5.10 缺少 proc_dou8vec_minmax（BBRv3 依赖的 5.15+ sysctl API），补两个前置补丁
@@ -1455,6 +1471,7 @@ jobs:
         run: |
           cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_KSU=y
+          CONFIG_KALLSYMS_ALL=y
           CONFIG_TMPFS_XATTR=y
           CONFIG_TMPFS_POSIX_ACL=y
           EOF
@@ -1497,10 +1514,7 @@ jobs:
             CURRENT_SUB=99999
           fi
           if [[ "${{ inputs.ksu_variant }}" == "BakaSU" && "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.15" && "$CURRENT_SUB" -ge 74 && "$CURRENT_SUB" -le 137 ]]; then
-            {
-              echo "CONFIG_KALLSYMS=y"
-              echo "CONFIG_KALLSYMS_ALL=y"
-            } >> "$DEFCONFIG"
+            echo "CONFIG_KALLSYMS=y" >> "$DEFCONFIG"
             # 修复 5.15.74~5.15.137: kallsyms_on_each_symbol 仅在 LIVEPATCH 下编译，导致 BakaSU 链接失败
             KALLSYMS_C="./common/kernel/kallsyms.c"
             if [ -f "$KALLSYMS_C" ] \
